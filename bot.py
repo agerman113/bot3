@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import requests
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
@@ -19,7 +20,6 @@ if not VK_GROUP_ID:
     print("ОШИБКА: Не найден VK_GROUP_ID в переменных окружения.", file=sys.stderr)
     sys.exit(1)
 
-# Убедимся, что GROUP_ID — целое число
 try:
     VK_GROUP_ID = int(VK_GROUP_ID)
 except ValueError:
@@ -35,7 +35,7 @@ if not OPENROUTER_API_KEY:
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
-# ---------- Данные о партнёрских сервисах (без изменений) ----------
+# ---------- Данные о партнёрских сервисах ----------
 OFFERS = {
     "foxford": {
         "name": "Фоксфорд",
@@ -98,7 +98,6 @@ OFFERS = {
     }
 }
 
-# Категории для кнопок меню
 CATEGORIES = {
     "repetitor": {
         "button": "🧑‍🏫 Репетитор / Подготовка к экзаменам",
@@ -127,10 +126,9 @@ CATEGORIES = {
     }
 }
 
-# Хранилище состояний пользователей (в памяти)
 user_sessions = {}
 
-# ---------- Вспомогательные функции (без изменений) ----------
+# ---------- Функции ----------
 
 def get_main_keyboard():
     keyboard = VkKeyboard(one_time=False)
@@ -147,12 +145,18 @@ def get_back_keyboard():
     return keyboard.get_keyboard()
 
 def send_message(vk, user_id, text, keyboard=None):
-    vk.method("messages.send", {
-        "user_id": user_id,
-        "message": text,
-        "random_id": get_random_id(),
-        "keyboard": keyboard
-    })
+    """Исправленный метод отправки сообщения (объектный стиль)"""
+    try:
+        params = {
+            "user_id": user_id,
+            "message": text,
+            "random_id": get_random_id()
+        }
+        if keyboard:
+            params["keyboard"] = keyboard
+        vk.messages.send(**params)
+    except vk_api.exceptions.ApiError as e:
+        print(f"Ошибка отправки сообщения: {e}", file=sys.stderr)
 
 def build_offers_text(category_id):
     offer_ids = CATEGORIES[category_id]["offers"]
@@ -175,12 +179,16 @@ def call_openrouter(messages):
         "temperature": 0.7,
         "max_tokens": 500
     }
-    response = requests.post(OPENROUTER_URL, headers=headers, json=payload)
-    if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"]
-    else:
-        print(f"OpenRouter error: {response.status_code} {response.text}", file=sys.stderr)
-        return "Извините, произошла ошибка при обращении к ИИ. Попробуйте позже."
+    try:
+        response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=10)
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"]
+        else:
+            print(f"OpenRouter error: {response.status_code} {response.text}", file=sys.stderr)
+            return "Извините, произошла ошибка при обращении к ИИ. Попробуйте позже."
+    except Exception as e:
+        print(f"OpenRouter exception: {e}", file=sys.stderr)
+        return "Извините, сервис временно недоступен. Попробуйте позже."
 
 def start_dialog(user_id, category_id):
     offers_desc = build_offers_text(category_id)
@@ -217,94 +225,98 @@ def continue_dialog(user_id, user_message):
 def reset_to_menu(user_id):
     user_sessions[user_id] = {"state": "menu"}
 
-# ---------- Основной обработчик ----------
+# ---------- Основной цикл с обработкой таймаутов ----------
 
 def main():
-    # Создаём сессию с токеном группы
     vk_session = vk_api.VkApi(token=VK_GROUP_TOKEN)
+    vk = vk_session.get_api()
 
     try:
-        vk = vk_session.get_api()
-        # Проверка токена
-        vk.groups.getById(group_id=VK_GROUP_ID)
-        print("Токен VK действителен, группа найдена.")
+        group_info = vk.groups.getById(group_id=VK_GROUP_ID)
+        print(f"Токен VK действителен, группа: {group_info[0]['name']}")
     except vk_api.exceptions.ApiError as e:
         print(f"Ошибка токена VK или ID группы: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Инициализация Long Poll для группы
-    try:
-        longpoll = VkLongPoll(vk_session, group_id=VK_GROUP_ID)
-    except vk_api.exceptions.ApiError as e:
-        print(f"Не удалось инициализировать LongPoll: {e}", file=sys.stderr)
-        print("Убедитесь, что у токена есть доступ к сообщениям группы и Long Poll API включён.", file=sys.stderr)
-        sys.exit(1)
+    # Создаём LongPoll с увеличенным временем ожидания
+    longpoll = VkLongPoll(vk_session, group_id=VK_GROUP_ID, wait=25)
 
     print("Бот запущен и ожидает сообщений...")
 
-    for event in longpoll.listen():
-        if event.type == VkEventType.MESSAGE_NEW and event.to_me and event.text:
-            user_id = event.user_id
-            text = event.text.strip()
+    while True:
+        try:
+            for event in longpoll.listen():
+                if event.type == VkEventType.MESSAGE_NEW and event.to_me and event.text:
+                    user_id = event.user_id
+                    text = event.text.strip()
 
-            if user_id not in user_sessions:
-                user_sessions[user_id] = {"state": "menu"}
+                    if user_id not in user_sessions:
+                        user_sessions[user_id] = {"state": "menu"}
 
-            state = user_sessions[user_id]["state"]
+                    state = user_sessions[user_id]["state"]
 
-            # Возврат в меню
-            if text.lower() in ["меню", "вернуться в меню", "🏠 вернуться в меню", "/start", "начать"]:
-                reset_to_menu(user_id)
-                send_message(
-                    vk, user_id,
-                    "👋 Привет! Я Учебный Навигатор — помогу выбрать лучший образовательный сервис.\n"
-                    "Выберите, что вас интересует:",
-                    keyboard=get_main_keyboard()
-                )
-                continue
+                    if text.lower() in ["меню", "вернуться в меню", "🏠 вернуться в меню", "/start", "начать"]:
+                        reset_to_menu(user_id)
+                        send_message(
+                            vk, user_id,
+                            "👋 Привет! Я Учебный Навигатор — помогу выбрать лучший образовательный сервис.\n"
+                            "Выберите, что вас интересует:",
+                            keyboard=get_main_keyboard()
+                        )
+                        continue
 
-            if state == "menu":
-                selected_cat = None
-                for cat_id, cat_data in CATEGORIES.items():
-                    if cat_data["button"].lower() == text.lower():
-                        selected_cat = cat_id
-                        break
+                    if state == "menu":
+                        selected_cat = None
+                        for cat_id, cat_data in CATEGORIES.items():
+                            if cat_data["button"].lower() == text.lower():
+                                selected_cat = cat_id
+                                break
 
-                if selected_cat:
-                    first_reply = start_dialog(user_id, selected_cat)
-                    send_message(
-                        vk, user_id,
-                        first_reply,
-                        keyboard=get_back_keyboard()
-                    )
-                else:
-                    send_message(
-                        vk, user_id,
-                        "Пожалуйста, выберите одну из кнопок ниже:",
-                        keyboard=get_main_keyboard()
-                    )
-                continue
+                        if selected_cat:
+                            first_reply = start_dialog(user_id, selected_cat)
+                            send_message(
+                                vk, user_id,
+                                first_reply,
+                                keyboard=get_back_keyboard()
+                            )
+                        else:
+                            send_message(
+                                vk, user_id,
+                                "Пожалуйста, выберите одну из кнопок ниже:",
+                                keyboard=get_main_keyboard()
+                            )
+                        continue
 
-            elif state == "dialog":
-                vk.method("messages.setActivity", {
-                    "user_id": user_id,
-                    "type": "typing"
-                })
-                reply = continue_dialog(user_id, text)
-                if reply:
-                    send_message(
-                        vk, user_id,
-                        reply,
-                        keyboard=get_back_keyboard()
-                    )
-                else:
-                    reset_to_menu(user_id)
-                    send_message(
-                        vk, user_id,
-                        "Что-то пошло не так. Давайте начнём заново.",
-                        keyboard=get_main_keyboard()
-                    )
-                continue
+                    elif state == "dialog":
+                        vk.messages.setActivity(user_id=user_id, type="typing")
+                        reply = continue_dialog(user_id, text)
+                        if reply:
+                            send_message(
+                                vk, user_id,
+                                reply,
+                                keyboard=get_back_keyboard()
+                            )
+                        else:
+                            reset_to_menu(user_id)
+                            send_message(
+                                vk, user_id,
+                                "Что-то пошло не так. Давайте начнём заново.",
+                                keyboard=get_main_keyboard()
+                            )
+                        continue
+
+        except requests.exceptions.ReadTimeout:
+            print("Таймаут Long Poll, переподключаюсь...", file=sys.stderr)
+            time.sleep(1)
+            continue
+        except requests.exceptions.ConnectionError as e:
+            print(f"Ошибка соединения: {e}, переподключаюсь...", file=sys.stderr)
+            time.sleep(5)
+            continue
+        except Exception as e:
+            print(f"Неизвестная ошибка в цикле: {e}", file=sys.stderr)
+            time.sleep(5)
+            continue
 
 if __name__ == "__main__":
     main()
