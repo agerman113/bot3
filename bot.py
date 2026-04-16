@@ -33,7 +33,7 @@ if not OPENROUTER_API_KEY:
     sys.exit(1)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "google/gemma-4-31b-it:free"
+MODEL = "minimax/minimax-m2.5:free"
 
 # ---------- Данные о партнёрских сервисах ----------
 OFFERS = {
