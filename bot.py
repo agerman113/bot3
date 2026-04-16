@@ -33,7 +33,7 @@ if not OPENROUTER_API_KEY:
     sys.exit(1)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+MODEL = "google/gemma-4-31b-it:free"
 
 # ---------- Данные о партнёрских сервисах ----------
 OFFERS = {
