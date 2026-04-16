@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import requests
 import vk_api
@@ -6,12 +7,35 @@ from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.utils import get_random_id
 
-# ---------- Конфигурация ----------
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")  # Ваш ключ OpenRouter
+# ---------- Получение токена и ID группы ----------
+VK_GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN")
+VK_GROUP_ID = os.getenv("VK_GROUP_ID")
+
+if not VK_GROUP_TOKEN:
+    print("ОШИБКА: Не найден VK_GROUP_TOKEN в переменных окружения.", file=sys.stderr)
+    sys.exit(1)
+
+if not VK_GROUP_ID:
+    print("ОШИБКА: Не найден VK_GROUP_ID в переменных окружения.", file=sys.stderr)
+    sys.exit(1)
+
+# Убедимся, что GROUP_ID — целое число
+try:
+    VK_GROUP_ID = int(VK_GROUP_ID)
+except ValueError:
+    print("ОШИБКА: VK_GROUP_ID должен быть числом.", file=sys.stderr)
+    sys.exit(1)
+
+# ---------- Конфигурация OpenRouter ----------
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    print("ОШИБКА: Не найден OPENROUTER_API_KEY", file=sys.stderr)
+    sys.exit(1)
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
-# Данные о партнёрских сервисах (из таблицы)
+# ---------- Данные о партнёрских сервисах (без изменений) ----------
 OFFERS = {
     "foxford": {
         "name": "Фоксфорд",
@@ -104,30 +128,25 @@ CATEGORIES = {
 }
 
 # Хранилище состояний пользователей (в памяти)
-user_sessions = {}  # user_id: {"state": "menu"/"dialog", "category": "...", "history": [...]}
+user_sessions = {}
 
-
-# ---------- Вспомогательные функции ----------
+# ---------- Вспомогательные функции (без изменений) ----------
 
 def get_main_keyboard():
-    """Клавиатура главного меню с кнопками категорий."""
     keyboard = VkKeyboard(one_time=False)
-    for cat_id, cat_data in CATEGORIES.items():
+    cat_items = list(CATEGORIES.items())
+    for i, (cat_id, cat_data) in enumerate(cat_items):
         keyboard.add_button(cat_data["button"], color=VkKeyboardColor.PRIMARY)
-        if cat_id != list(CATEGORIES.keys())[-1]:
+        if i < len(cat_items) - 1:
             keyboard.add_line()
     return keyboard.get_keyboard()
 
-
 def get_back_keyboard():
-    """Клавиатура с кнопкой «Вернуться в меню»."""
     keyboard = VkKeyboard(one_time=False)
     keyboard.add_button("🏠 Вернуться в меню", color=VkKeyboardColor.SECONDARY)
     return keyboard.get_keyboard()
 
-
 def send_message(vk, user_id, text, keyboard=None):
-    """Отправка сообщения пользователю."""
     vk.method("messages.send", {
         "user_id": user_id,
         "message": text,
@@ -135,9 +154,7 @@ def send_message(vk, user_id, text, keyboard=None):
         "keyboard": keyboard
     })
 
-
 def build_offers_text(category_id):
-    """Создаёт текстовое описание оферов для заданной категории."""
     offer_ids = CATEGORIES[category_id]["offers"]
     lines = ["**Рекомендованные сервисы:**\n"]
     for oid in offer_ids:
@@ -147,9 +164,7 @@ def build_offers_text(category_id):
         lines.append(f"🔗 Ссылка: {offer['link']}\n")
     return "\n".join(lines)
 
-
 def call_openrouter(messages):
-    """Обращение к OpenRouter API."""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
@@ -164,11 +179,10 @@ def call_openrouter(messages):
     if response.status_code == 200:
         return response.json()["choices"][0]["message"]["content"]
     else:
+        print(f"OpenRouter error: {response.status_code} {response.text}", file=sys.stderr)
         return "Извините, произошла ошибка при обращении к ИИ. Попробуйте позже."
 
-
 def start_dialog(user_id, category_id):
-    """Инициализация диалогового режима с ИИ."""
     offers_desc = build_offers_text(category_id)
     system_prompt = (
         "Ты — Учебный Навигатор, дружелюбный помощник в выборе образовательных услуг. "
@@ -189,38 +203,42 @@ def start_dialog(user_id, category_id):
     }
     return user_sessions[user_id]["history"][-1]["content"]
 
-
 def continue_dialog(user_id, user_message):
-    """Продолжение диалога с ИИ."""
     session = user_sessions.get(user_id)
     if not session or session["state"] != "dialog":
         return None
-
-    # Добавляем сообщение пользователя в историю
     session["history"].append({"role": "user", "content": user_message})
-
-    # Получаем ответ от ИИ
     reply = call_openrouter(session["history"])
     session["history"].append({"role": "assistant", "content": reply})
-
-    # Ограничиваем длину истории (последние 10 сообщений)
-    if len(session["history"]) > 21:  # system + 10 пар user/assistant
+    if len(session["history"]) > 21:
         session["history"] = [session["history"][0]] + session["history"][-20:]
-
     return reply
 
-
 def reset_to_menu(user_id):
-    """Сброс состояния пользователя в главное меню."""
     user_sessions[user_id] = {"state": "menu"}
-
 
 # ---------- Основной обработчик ----------
 
 def main():
-    vk_session = vk_api.VkApi(token=os.getenv("VK_TOKEN"))
-    vk = vk_session.get_api()
-    longpoll = VkLongPoll(vk_session)
+    # Создаём сессию с токеном группы
+    vk_session = vk_api.VkApi(token=VK_GROUP_TOKEN)
+
+    try:
+        vk = vk_session.get_api()
+        # Проверка токена
+        vk.groups.getById(group_id=VK_GROUP_ID)
+        print("Токен VK действителен, группа найдена.")
+    except vk_api.exceptions.ApiError as e:
+        print(f"Ошибка токена VK или ID группы: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Инициализация Long Poll для группы
+    try:
+        longpoll = VkLongPoll(vk_session, group_id=VK_GROUP_ID)
+    except vk_api.exceptions.ApiError as e:
+        print(f"Не удалось инициализировать LongPoll: {e}", file=sys.stderr)
+        print("Убедитесь, что у токена есть доступ к сообщениям группы и Long Poll API включён.", file=sys.stderr)
+        sys.exit(1)
 
     print("Бот запущен и ожидает сообщений...")
 
@@ -229,13 +247,12 @@ def main():
             user_id = event.user_id
             text = event.text.strip()
 
-            # Получаем или создаём сессию
             if user_id not in user_sessions:
                 user_sessions[user_id] = {"state": "menu"}
 
             state = user_sessions[user_id]["state"]
 
-            # Обработка кнопки возврата в меню (в любом состоянии)
+            # Возврат в меню
             if text.lower() in ["меню", "вернуться в меню", "🏠 вернуться в меню", "/start", "начать"]:
                 reset_to_menu(user_id)
                 send_message(
@@ -246,9 +263,7 @@ def main():
                 )
                 continue
 
-            # Главное меню
             if state == "menu":
-                # Ищем категорию по тексту кнопки
                 selected_cat = None
                 for cat_id, cat_data in CATEGORIES.items():
                     if cat_data["button"].lower() == text.lower():
@@ -256,7 +271,6 @@ def main():
                         break
 
                 if selected_cat:
-                    # Запускаем диалог
                     first_reply = start_dialog(user_id, selected_cat)
                     send_message(
                         vk, user_id,
@@ -264,7 +278,6 @@ def main():
                         keyboard=get_back_keyboard()
                     )
                 else:
-                    # Неизвестная команда — показываем меню
                     send_message(
                         vk, user_id,
                         "Пожалуйста, выберите одну из кнопок ниже:",
@@ -272,14 +285,11 @@ def main():
                     )
                 continue
 
-            # Режим диалога с ИИ
             elif state == "dialog":
-                # Отправляем индикатор набора текста (опционально)
                 vk.method("messages.setActivity", {
                     "user_id": user_id,
                     "type": "typing"
                 })
-
                 reply = continue_dialog(user_id, text)
                 if reply:
                     send_message(
@@ -288,7 +298,6 @@ def main():
                         keyboard=get_back_keyboard()
                     )
                 else:
-                    # Если что-то пошло не так, возвращаем в меню
                     reset_to_menu(user_id)
                     send_message(
                         vk, user_id,
@@ -296,7 +305,6 @@ def main():
                         keyboard=get_main_keyboard()
                     )
                 continue
-
 
 if __name__ == "__main__":
     main()
